@@ -8,6 +8,7 @@ import numpy as np
 from mmcv.utils import print_log
 from prettytable import PrettyTable
 from torch.utils.data import Dataset
+import torch
 
 from mmseg.core import eval_metrics, intersect_and_union, pre_eval_to_metrics
 from mmseg.utils import get_root_logger
@@ -88,10 +89,13 @@ class CustomDataset(Dataset):
                  test_mode=False,
                  ignore_index=255,
                  reduce_zero_label=False,
+                 keep_empty_prob=1.,
                  classes=None,
                  palette=None,
                  gt_seg_map_loader_cfg=None,
-                 file_client_args=dict(backend='disk')):
+                 file_client_args=dict(backend='disk'),
+                 multi_label=False):
+        self.multi_label = multi_label
         self.pipeline = Compose(pipeline)
         self.img_dir = img_dir
         self.img_suffix = img_suffix
@@ -129,6 +133,8 @@ class CustomDataset(Dataset):
         self.img_infos = self.load_annotations(self.img_dir, self.img_suffix,
                                                self.ann_dir,
                                                self.seg_map_suffix, self.split)
+        self.keep_empty_prob = keep_empty_prob
+        self.get_resample_weight()
 
     def __len__(self):
         """Total number of samples of data."""
@@ -250,6 +256,24 @@ class CustomDataset(Dataset):
     def format_results(self, results, imgfile_prefix, indices=None, **kwargs):
         """Place holder to format result to dataset specific output."""
         raise NotImplementedError
+    
+    def get_resample_weight(self):
+        if self.multi_label and self.keep_empty_prob != 1:
+            probs = []
+            for idx in range(len(self)):
+                gt = self.get_gt_seg_map_by_idx(idx)
+                probs.append(self.keep_empty_prob if gt.sum() == 0 else 1)
+            probs = np.array(probs)
+            probs /= probs.sum()
+        else:
+            probs = None
+        self.probs = probs
+
+    def resample(self, idx):
+        if self.probs is None:
+            return idx
+        else:
+            return np.random.choice(len(self), p = self.probs)
 
     def get_gt_seg_map_by_idx(self, index):
         """Get one ground truth segmentation map for evaluation."""
@@ -274,7 +298,7 @@ class CustomDataset(Dataset):
             self.gt_seg_map_loader(results)
             yield results['gt_semantic_seg']
 
-    def pre_eval(self, preds, indices):
+    def pre_eval(self, preds, loss, indices):
         """Collect eval result from each iteration.
 
         Args:
@@ -297,19 +321,24 @@ class CustomDataset(Dataset):
 
         for pred, index in zip(preds, indices):
             seg_map = self.get_gt_seg_map_by_idx(index)
-            pre_eval_results.append(
-                intersect_and_union(
-                    pred,
-                    seg_map,
-                    len(self.CLASSES),
-                    self.ignore_index,
-                    # as the labels has been converted when dataset initialized
-                    # in `get_palette_for_custom_classes ` this `label_map`
-                    # should be `dict()`, see
-                    # https://github.com/open-mmlab/mmsegmentation/issues/1415
-                    # for more ditails
-                    label_map=dict(),
-                    reduce_zero_label=self.reduce_zero_label))
+            if self.multi_label:
+                ious = []
+                for i in range(len(self.CLASSES)):
+                    iou = intersect_and_union(pred[...,i], seg_map[...,i], 2,
+                                        self.ignore_index, self.label_map,
+                                        self.reduce_zero_label)
+                    ious.append(iou)
+                ious = tuple([torch.stack([_[i] for _ in ious], 0)[:,1] for i in range(len(ious[0]))])
+                pre_eval_results.append(ious)
+            else:
+                pre_eval_results.append(
+                    intersect_and_union(pred, seg_map, len(self.CLASSES),
+                                        self.ignore_index, self.label_map,
+                                        self.reduce_zero_label))
+
+        for i in range(len(pre_eval_results)):
+            pre_eval_results[i] = list(pre_eval_results[i])
+            pre_eval_results[i].append(loss)
 
         return pre_eval_results
 
